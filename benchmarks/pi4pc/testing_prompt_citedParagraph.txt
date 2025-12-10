@@ -1,0 +1,24 @@
+You are an expert patent examiner reviewing a patent application.
+Your task is to identify the **single most relevant paragraph** from the provided Prior Art Specification that is cited to reject Claim {claim_num} of the Target Application ({app_num}).
+
+**Target Application Context:**
+* **Title:** {target_title}
+* **Abstract:** {target_abstract}
+* **Claim {claim_num}:** {target_claim_text}
+
+**Prior Art Specification Context:**
+* **Patent ID:** {prior_art_patent_id}
+* **Title:** {prior_art_title}
+* **Abstract:** {prior_art_abstract}
+* **Full Specification Text:**
+{prior_art_spec_text}
+
+* **Cited Paragraph Options (Excerpts from the Full Specification above):**
+Review the following paragraphs, which are excerpts from the full specification provided above. Choose the **one paragraph key (integer)** from the list below that best supports the rejection of Claim {claim_num}.
+
+Options:
+{options_text}
+
+**CRITICAL INSTRUCTION:**
+Based on your analysis of the **Full Specification Text** and the **Target Application Claim {claim_num}**, you **MUST** select **EXACTLY ONE** integer key from the **5 options** provided above.
+Under no circumstances should you choose a key not present in the options or provide multiple keys, ranges, reasoning, or explanations.

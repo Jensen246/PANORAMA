@@ -23,17 +23,51 @@ import numpy as np
 from sklearn.metrics import f1_score, precision_recall_fscore_support
 from pydantic import BaseModel, Field
 from datasets import load_dataset
+import asyncio
+from tqdm import tqdm
 
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 
 load_dotenv()
 
 warnings.filterwarnings(action='ignore')
 
-DATASET_NAME = "DxD-Lab/PANORAMA-NOC4PC-Bench"
+DATASET_NAME = "LG-AI-Research/PANORAMA"
+DATASET_CONFIG = "NOC4PC"
+
+
+def load_benchmark_data():
+    """Load benchmark data from local cache or HuggingFace."""
+    import os
+    cache_base = os.path.expanduser("~/.cache/huggingface/hub/datasets--LG-AI-Research--PANORAMA")
+    parquet_path = None
+    if os.path.exists(cache_base):
+        snapshots = os.path.join(cache_base, "snapshots")
+        if os.path.exists(snapshots):
+            for d in os.listdir(snapshots):
+                candidate = os.path.join(snapshots, d, DATASET_CONFIG, "test.parquet")
+                if os.path.exists(candidate):
+                    parquet_path = candidate
+                    break
+
+    if parquet_path:
+        print(f"Loading from local cache: {parquet_path}")
+        df = pd.read_parquet(parquet_path)
+    else:
+        from huggingface_hub import hf_hub_download
+        parquet_path = hf_hub_download(
+            repo_id=DATASET_NAME,
+            filename=f"{DATASET_CONFIG}/test.parquet",
+            repo_type="dataset"
+        )
+        df = pd.read_parquet(parquet_path)
+
+    return df.to_dict("records")
+
 
 class ZeroShotRejectionAnswer(BaseModel):
     code: Literal["ALLOW", "102", "103"] = Field(description="The rejection code (ALLOW, 102, or 103).")
@@ -359,16 +393,14 @@ def run_baseline_1_evaluation(baseline_1_runs: int = 20):
     calculate average performance by running multiple times
     """
     print(f"Starting Baseline 1 (Random Selection) evaluation with {baseline_1_runs} runs")
-    print(f"Loading benchmark data from Hugging Face dataset {DATASET_NAME} (test split)")
+    print(f"Loading data from {DATASET_NAME}/{DATASET_CONFIG}")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
-        benchmark_data_list = df.to_dict("records")
+        benchmark_data_list = load_benchmark_data()
         total_items = len(benchmark_data_list)
-        print(f"Loaded {total_items} items from Hugging Face dataset.")
+        print(f"Loaded {total_items} items.")
     except Exception as e:
-        print(f"Error loading dataset from Hugging Face: {e}")
+        print(f"Error loading dataset: {e}")
         print(traceback.format_exc())
         return
 
@@ -536,16 +568,14 @@ def run_baseline_2_evaluation():
     compare performance for each option
     """
     print(f"Starting Baseline 2 (Fixed Selection) evaluation")
-    print(f"Loading benchmark data from Hugging Face dataset {DATASET_NAME} (test split)")
+    print(f"Loading data from {DATASET_NAME}/{DATASET_CONFIG}")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
-        benchmark_data_list = df.to_dict("records")
+        benchmark_data_list = load_benchmark_data()
         total_items = len(benchmark_data_list)
-        print(f"Loaded {total_items} items from Hugging Face dataset.")
+        print(f"Loaded {total_items} items.")
     except Exception as e:
-        print(f"Error loading dataset from Hugging Face: {e}")
+        print(f"Error loading dataset: {e}")
         print(traceback.format_exc())
         return
 
@@ -697,18 +727,116 @@ def run_baseline_2_evaluation():
     
     print(f"\nAll results saved in directory: {results_dir}")
 
-def main(provider: str, model_name: str, prompt_mode: str):
-    print(f"Starting Rejection benchmark test with {provider} - {model_name}")
-    print(f"Loading benchmark data from Hugging Face dataset {DATASET_NAME} (test split)")
+async def process_single_item(index, benchmark_data, chat, provider, prompt_mode, semaphore, pbar):
+    """Process a single item with concurrency control."""
+    async with semaphore:
+        app_num = benchmark_data.get("application_number", "N/A")
+        claim_num = benchmark_data.get("claim_number", "N/A")
+        identifier = f"rejection_app{app_num}_cl{claim_num}_{index}"
+
+        llm_response_object = None
+        llm_raw_response_str = ""
+        predicted_code = None
+        predicted_reason = None
+        is_code_correct = False
+        error_message = ""
+        success = False
+
+        result_row_dict = {
+            "identifier": identifier,
+            "target_patent": app_num,
+            "target_claim": claim_num,
+            "gold_code": "N/A", "predicted_code": "N/A", "is_code_correct": False,
+            "gold_reason": "N/A", "predicted_reason": "N/A", "llm_raw_response": "", "error": ""
+        }
+
+        try:
+            answer_raw = benchmark_data.get("answer", {})
+            if isinstance(answer_raw, str):
+                try:
+                    gold_answer = json.loads(answer_raw)
+                    if not isinstance(gold_answer, dict): gold_answer = {}
+                except json.JSONDecodeError:
+                    gold_answer = {}
+            else:
+                gold_answer = answer_raw if isinstance(answer_raw, dict) else {}
+
+            gold_code = str(gold_answer.get("code")).strip().upper() if gold_answer.get("code") else None
+            gold_reason = str(gold_answer.get("reason")).strip() if gold_answer.get("reason") else None
+            result_row_dict["gold_code"] = gold_code if gold_code else "N/A"
+            result_row_dict["gold_reason"] = gold_reason if gold_reason else "N/A"
+
+            if not gold_code:
+                error_message = "Missing gold code in benchmark data"
+                result_row_dict["error"] = error_message
+            else:
+                prompt = create_rejection_prompt(benchmark_data, prompt_mode)
+
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        system_message = SystemMessage(content="You are an expert patent examiner predicting claim rejection. Respond in the requested JSON format.")
+                        human_message = HumanMessage(content=prompt)
+
+                        loop = asyncio.get_event_loop()
+                        if provider.lower() == 'google':
+                            llm_response_object = await loop.run_in_executor(None, lambda: chat.invoke([system_message, human_message]))
+                            if llm_response_object is None:
+                                raise ValueError("LLM invoke returned None.")
+                            llm_raw_response_str = llm_response_object.model_dump_json()
+                        elif provider.lower() == "anthropic":
+                            response = await loop.run_in_executor(None, lambda: chat([system_message, human_message]))
+                            if response.tool_calls:
+                                llm_response_object = response.tool_calls[0]["args"]
+                                llm_raw_response_str = json.dumps(llm_response_object)
+                            else:
+                                llm_response_object = {"code": None, "reason": None}
+                                llm_raw_response_str = response.content.strip()
+                        else:  # openai
+                            response = await loop.run_in_executor(None, lambda: chat([system_message, human_message]))
+                            llm_raw_response_str = response.content.strip()
+                            try:
+                                llm_response_object = json.loads(llm_raw_response_str)
+                            except json.JSONDecodeError:
+                                llm_response_object = {"code": None, "reason": None}
+
+                        predicted_code, predicted_reason = process_llm_response_rejection(llm_response_object)
+                        error_message = ""
+                        success = True
+                        break
+                    except Exception as e:
+                        error_message = f"LLM call failed (attempt {attempt+1}/{max_retries}): {type(e).__name__}: {e}"
+                        llm_raw_response_str = f"Error: {error_message}"
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+
+                if success and predicted_code is not None and gold_code:
+                    is_code_correct = evaluate_rejection_prediction(predicted_code, gold_code)
+
+            result_row_dict["predicted_code"] = predicted_code if predicted_code else "N/A"
+            result_row_dict["is_code_correct"] = is_code_correct
+            result_row_dict["predicted_reason"] = predicted_reason if predicted_reason else "N/A"
+            result_row_dict["llm_raw_response"] = llm_raw_response_str
+            result_row_dict["error"] = error_message
+
+        except Exception as e:
+            error_msg = f"Error processing {identifier}: {type(e).__name__}: {e}"
+            result_row_dict["error"] = error_msg
+
+        pbar.update(1)
+        return result_row_dict, gold_code, predicted_code
+
+
+def main(provider: str, model_name: str, prompt_mode: str, concurrency: int = 10):
+    print(f"Starting Rejection benchmark test with {provider} - {model_name} (concurrency={concurrency})")
+    print(f"Loading data from {DATASET_NAME}/{DATASET_CONFIG}")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
-        benchmark_data_list = df.to_dict("records")
+        benchmark_data_list = load_benchmark_data()
         total_items = len(benchmark_data_list)
-        print(f"Loaded {total_items} items from Hugging Face dataset.")
+        print(f"Loaded {total_items} items.")
     except Exception as e:
-        print(f"Error loading dataset from Hugging Face: {e}")
+        print(f"Error loading dataset: {e}")
         print(traceback.format_exc())
         return
 
@@ -737,146 +865,41 @@ def main(provider: str, model_name: str, prompt_mode: str):
     except IOError as e:
         print(f"Error initializing CSV file {results_file}: {e}"); return
 
+    chat = get_chat_model(provider, model_name, prompt_mode)
 
+    # Run async concurrent processing
+    async def run_concurrent():
+        semaphore = asyncio.Semaphore(concurrency)
+        with tqdm(total=len(benchmark_data_list), desc="Processing") as pbar:
+            tasks = [
+                process_single_item(idx, data, chat, provider, prompt_mode, semaphore, pbar)
+                for idx, data in enumerate(benchmark_data_list)
+            ]
+            results = await asyncio.gather(*tasks)
+        return results
+
+    results = asyncio.run(run_concurrent())
+
+    # Aggregate results
     all_gold_codes = []
     all_predicted_codes = []
-
-
-    total_processed = 0
     errors = 0
     correct_code_predictions = 0
 
-    chat = get_chat_model(provider, model_name, prompt_mode)
-
-    for index, benchmark_data in enumerate(benchmark_data_list):
-        total_processed += 1
-        app_num = benchmark_data.get("application_number", "N/A")
-        claim_num = benchmark_data.get("claim_number", "N/A")
-        identifier = f"rejection_app{app_num}_cl{claim_num}_{index}"
-
-        print(f"\rProcessing: {total_processed}/{total_items} ({((total_processed)/total_items)*100:.1f}%) - {identifier}", end="")
-
-        llm_response_object = None
-        llm_raw_response_str = ""
-        predicted_code = None
-        predicted_reason = None
-        is_code_correct = False
-        error_message = ""
-        success = False
-
-        result_row_dict = {
-            "identifier": identifier,
-            "target_patent": app_num,
-            "target_claim": claim_num,
-            "gold_code": "N/A", "predicted_code": "N/A", "is_code_correct": False,
-            "gold_reason": "N/A", "predicted_reason": "N/A", "llm_raw_response": "", "error": ""
-        }
-
-        try:
-            answer_raw = benchmark_data.get("answer", {})
-            if isinstance(answer_raw, str):
-                try:
-                    gold_answer = json.loads(answer_raw)
-                    if not isinstance(gold_answer, dict): gold_answer = {}
-                except json.JSONDecodeError:
-                    print(f"\nWarning: Could not decode answer JSON for {identifier}. Treating as empty.")
-                    gold_answer = {}
-            else:
-                gold_answer = answer_raw if isinstance(answer_raw, dict) else {}
-
-            gold_code = str(gold_answer.get("code")).strip().upper() if gold_answer.get("code") else None
-            gold_reason = str(gold_answer.get("reason")).strip() if gold_answer.get("reason") else None
-            result_row_dict["gold_code"] = gold_code if gold_code else "N/A"
-            result_row_dict["gold_reason"] = gold_reason if gold_reason else "N/A"
-
-
-            if not gold_code:
-                 print(f"\nWarning: Missing gold 'code' for {identifier}. Skipping evaluation.")
-                 error_message = "Missing gold code in benchmark data"
-                 result_row_dict["error"] = error_message
-                 errors += 1
-            else:
-                prompt = create_rejection_prompt(benchmark_data, prompt_mode)
-
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        system_message = SystemMessage(content="You are an expert patent examiner predicting claim rejection. Respond in the requested JSON format.")
-                        human_message = HumanMessage(content=prompt)
-
-                        if provider.lower() == 'google':
-                            llm_response_object = chat.invoke([system_message, human_message])
-                            if llm_response_object is None:
-                                raise ValueError("LLM invoke returned None. Possible API issue or structured output failure.")
-                            llm_raw_response_str = llm_response_object.model_dump_json()
-                        elif provider.lower() == "anthropic":
-                            response = chat([system_message, human_message])
-                            if response.tool_calls:
-                                llm_response_object = response.tool_calls[0]["args"]
-                                llm_raw_response_str = json.dumps(llm_response_object)
-                            else:
-                                llm_response_object = {"code": None, "reason": None}
-                                llm_raw_response_str = response.content.strip()
-                                print(f"\nWarning: Anthropic response did not contain tool calls: {llm_raw_response_str}")
-                        else:  # openai
-                            response = chat([system_message, human_message])
-                            llm_raw_response_str = response.content.strip()
-                            try:
-                                llm_response_object = json.loads(llm_raw_response_str)
-                            except json.JSONDecodeError:
-                                print(f"\nWarning: Could not parse OpenAI response as JSON: {llm_raw_response_str}")
-                                llm_response_object = {"code": None, "reason": None}
-
-
-                        predicted_code, predicted_reason = process_llm_response_rejection(llm_response_object)
-                        error_message = ""
-                        success = True
-                        break
-                    except Exception as e:
-                        error_message = f"LLM call failed (attempt {attempt+1}/{max_retries}): {type(e).__name__}: {e}"
-                        llm_raw_response_str = f"Error: {error_message}"
-                        if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt
-                            time.sleep(wait_time)
-
-                if success:
-                    if predicted_code is not None:
-                        is_code_correct = evaluate_rejection_prediction(predicted_code, gold_code)
-                        if is_code_correct:
-                            correct_code_predictions += 1
-                    else:
-                         error_message = "LLM response parsing failed (Code could not be extracted)"
-                         errors += 1
-                else:
-                    errors += 1
-
-            result_row_dict["predicted_code"] = predicted_code if predicted_code else "N/A"
-            result_row_dict["is_code_correct"] = is_code_correct if success and predicted_code is not None else False
-            result_row_dict["predicted_reason"] = predicted_reason if predicted_reason else "N/A"
-            result_row_dict["llm_raw_response"] = llm_raw_response_str
-            result_row_dict["error"] = error_message
-
-            all_gold_codes.append(gold_code)
-            all_predicted_codes.append(predicted_code)
-
-
-            try:
-                with open(results_file, 'a', newline='', encoding='utf-8-sig') as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=csv_header)
-                    writer.writerow(result_row_dict)
-            except IOError as e:
-                print(f"\n  [!] Error writing row {index} to CSV {results_file}: {e}")
-
-
-        except Exception as e:
-            error_msg = f"Error processing data for item {index} ({identifier}): {type(e).__name__}: {e}"
-            print(f"\n  [!] {error_msg}")
-            print(traceback.format_exc())
+    for result_row_dict, gold_code, predicted_code in results:
+        all_gold_codes.append(gold_code)
+        all_predicted_codes.append(predicted_code)
+        if result_row_dict["error"]:
             errors += 1
-            with open(error_log_file, 'a', encoding='utf-8') as f_err:
-                 f_err.write(f"{datetime.now().isoformat()} - {error_msg}\n")
-                 f_err.write(traceback.format_exc() + "\n\n")
-            result_row_dict["error"] = error_msg
+        if result_row_dict["is_code_correct"]:
+            correct_code_predictions += 1
+        # Write to CSV
+        try:
+            with open(results_file, 'a', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=csv_header)
+                writer.writerow(result_row_dict)
+        except IOError as e:
+            print(f"Error writing to CSV: {e}")
 
 
 
@@ -915,7 +938,7 @@ def main(provider: str, model_name: str, prompt_mode: str):
 
     print("\n--- Rejection Benchmark Test Summary ---")
     print(f"Total Items Loaded: {total_items}")
-    print(f"Total Items Processed: {total_processed}")
+    print(f"Total Items Processed: {len(results)}")
     print(f"Correct Code Predictions: {correct_code_predictions}")
     print(f"Processing Errors (Data/LLM/Parsing): {errors}")
 
@@ -932,7 +955,7 @@ def main(provider: str, model_name: str, prompt_mode: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Run rejection prediction benchmark test using DxD-Lab/PANORAMA-NOC4PC-Bench dataset from Hugging Face.')
+    parser = argparse.ArgumentParser(description='Run rejection prediction benchmark test using PANORAMA dataset.')
     parser.add_argument('--provider', type=str, required=False,
                        choices=['openai', 'anthropic', 'google'],
                        help='LLM provider (openai, anthropic, or google)')
@@ -941,6 +964,8 @@ if __name__ == "__main__":
     parser.add_argument('--prompt_mode', type=str, default='zero-shot',
                         choices=['zero-shot', 'cot', 'cot_base'],
                         help="Prompt style: 'zero-shot' (default) or 'cot' (Chain-of-Thought)")
+    parser.add_argument('--concurrency', type=int, default=10,
+                        help='Number of concurrent requests (default: 10)')
 
     parser.add_argument('--baseline-1', action='store_true',
                         help='Run Baseline 1: random selection from possible codes')
@@ -948,7 +973,7 @@ if __name__ == "__main__":
                         help='Number of runs for Baseline 1 (default: 20)')
     parser.add_argument('--baseline-2', action='store_true',
                         help='Run Baseline 2: fixed selection for each possible code')
-    
+
     args = parser.parse_args()
 
     if args.baseline_1:
@@ -958,7 +983,7 @@ if __name__ == "__main__":
     else:
         if not args.provider or not args.model:
             parser.error("--provider and --model are required when not using baseline modes")
-        
+
         try:
             import pandas
             import pyarrow
@@ -969,7 +994,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
         try:
-            main(args.provider, args.model, args.prompt_mode)
+            main(args.provider, args.model, args.prompt_mode, args.concurrency)
         except Exception as e:
             print(f"\nCritical error in main execution: {str(e)}")
             print(traceback.format_exc())

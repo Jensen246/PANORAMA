@@ -20,6 +20,8 @@ import csv
 import random
 from pydantic import BaseModel, Field
 from datasets import load_dataset
+import asyncio
+from tqdm.asyncio import tqdm as atqdm
 
 
 from langchain_openai import ChatOpenAI
@@ -98,9 +100,9 @@ def get_chat_model(provider: str, model_name: str, prompt_mode:str):
             }
         )
 
-        if prompt_mode == "cot" or "cot_base":
+        if prompt_mode in ("cot", "cot_base"):
             structured_llm = chat_model_base.with_structured_output(CoTAnswer)
-        else: # zero-shot
+        else:  # zero-shot
             structured_llm = chat_model_base.with_structured_output(ZeroShotAnswer)
 
         return structured_llm
@@ -402,72 +404,41 @@ def evaluate_and_log_3x2_matrix(gold_answers: List[str], silver_answers: List[st
     result_row_dict["negative_negative"]= matrix["negative_negative"]
 
 
-DATASET_NAME = "DxD-Lab/PANORAMA-PAR4PC-Bench"
+DATASET_NAME = "LG-AI-Research/PANORAMA"
+DATASET_CONFIG = "PAR4PC"
 
-def main(provider: str, model_name: str, prompt_mode: str):
-    print(f"Starting benchmark test with {provider} - {model_name} using Hugging Face dataset {DATASET_NAME} (test split)")
-    
-    try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
-        total_par4pcs = len(df)
-        print(f"Loaded {total_par4pcs} par4pcs from Hugging Face dataset {DATASET_NAME} (test split).")
-    except Exception as e:
-        print(f"Error loading dataset from Hugging Face {DATASET_NAME}: {e}")
-        print(traceback.format_exc())
-        return
 
-    if df.empty:
-        print(f"Error: No data found in the dataset.")
-        return
+def load_benchmark_data():
+    """Load benchmark data from local cache or HuggingFace."""
+    import os
+    cache_base = os.path.expanduser("~/.cache/huggingface/hub/datasets--LG-AI-Research--PANORAMA")
+    parquet_path = None
+    if os.path.exists(cache_base):
+        snapshots = os.path.join(cache_base, "snapshots")
+        if os.path.exists(snapshots):
+            for d in os.listdir(snapshots):
+                candidate = os.path.join(snapshots, d, DATASET_CONFIG, "test.parquet")
+                if os.path.exists(candidate):
+                    parquet_path = candidate
+                    break
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dataset_name_for_path = DATASET_NAME.replace("/", "_")
-    result_dir_name = f'result_{timestamp}_{provider}_{model_name}_{prompt_mode}_{dataset_name_for_path}'
-        
-    result_dir = Path(__file__).parent / 'result' / result_dir_name
-    result_dir.mkdir(parents=True, exist_ok=True)
-    results_file = result_dir / "evaluation_results.csv"
-    error_log_file = result_dir / "error_log.txt"
+    if parquet_path:
+        print(f"Loading from local cache: {parquet_path}")
+        df = pd.read_parquet(parquet_path)
+    else:
+        from huggingface_hub import hf_hub_download
+        parquet_path = hf_hub_download(
+            repo_id=DATASET_NAME,
+            filename=f"{DATASET_CONFIG}/test.parquet",
+            repo_type="dataset"
+        )
+        df = pd.read_parquet(parquet_path)
 
-    csv_header = ["identifier", "claim_number", "application_number",
-                  "gold_answers", "silver_answers", "negative_answers",
-                  "predicted_answers", "llm_raw_response", "is_correct", "error",
-                  "model_score", "max_score", 
-                  "gold_answer", "silver_answer", "negative_answer",
-                  "gold_negative", "silver_negative", "negative_negative"]
+    return df
 
-    try:
-        with open(results_file, 'w', newline='', encoding='utf-8-sig') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=csv_header)
-            writer.writeheader()
-        print(f"Results CSV file initialized: {results_file}")
-    except IOError as e:
-        print(f"Error initializing CSV file {results_file}: {e}")
-        return
-
-    correct_predictions = 0
-    errors = 0
-    total_model_score = 0
-    total_max_score = 0
-
-    all_gold_answers = []
-    all_silver_answers = []
-    all_negative_answers = []
-    all_predicted_answers = []
-
-    total_gold_answer = 0
-    total_silver_answer = 0
-    total_negative_answer = 0
-    total_gold_negative = 0
-    total_silver_negative = 0
-    total_negative_negative = 0
-
-    chat = get_chat_model(provider, model_name, prompt_mode)
-
-    for index, row in df.iterrows():
-        print(f"\n\rProcessing: {index + 1}/{total_par4pcs} ({((index + 1)/total_par4pcs)*100:.1f}%)", end="")
-
+async def process_single_item(index, row, chat, provider, prompt_mode, semaphore, results_file, csv_header, error_log_file, pbar):
+    """Process a single item with concurrency control."""
+    async with semaphore:
         par4pc_identifier = f"app_{row.get('application_number', 'N/A')}_claim_{row.get('claim_number', 'N/A')}"
 
         llm_response_object = None
@@ -491,16 +462,14 @@ def main(provider: str, model_name: str, prompt_mode: str):
         }
 
         try:
-            par4pc_data_dict = row.to_dict()
+            par4pc_data_dict = row
             prompt = create_par4pc_prompt(par4pc_data_dict, prompt_mode)
 
             gold_answers_raw = row.get("gold_answers")
             gold_answers_list = process_answer_string(gold_answers_raw)
-            all_gold_answers.append(gold_answers_list)
 
             silver_answers_raw = row.get("silver_answers")
             silver_answers_list = process_answer_string(silver_answers_raw)
-            all_silver_answers.append(silver_answers_list)
 
             max_retries = 3
             success = False
@@ -509,32 +478,27 @@ def main(provider: str, model_name: str, prompt_mode: str):
                     system_message = SystemMessage(content="You are an expert patent examiner identifying cited patents based on context and options. Respond in the requested JSON format.")
                     human_message = HumanMessage(content=prompt)
 
+                    loop = asyncio.get_event_loop()
                     if provider.lower() == 'google':
-                        llm_response_object = chat.invoke([system_message, human_message])
-
+                        llm_response_object = await loop.run_in_executor(None, lambda: chat.invoke([system_message, human_message]))
                         if llm_response_object is None:
-                            raise ValueError("LLM invoke returned None. Possible API issue or structured output failure.")
-
+                            raise ValueError("LLM invoke returned None.")
                         llm_raw_response_str = llm_response_object.model_dump_json()
-
                     elif provider.lower() == "anthropic":
-                        response = chat([system_message, human_message])
+                        response = await loop.run_in_executor(None, lambda: chat([system_message, human_message]))
                         if response.tool_calls:
                             llm_response_object = response.tool_calls[0]["args"]
                             llm_raw_response_str = json.dumps(llm_response_object)
                         else:
                             llm_response_object = {"answer": ""}
                             llm_raw_response_str = response.content.strip()
-                            print(f"\nWarning: Anthropic response did not contain tool calls: {llm_raw_response_str}")
-
                     else:
-                         response = chat([system_message, human_message])
-                         llm_raw_response_str = response.content.strip()
-                         try:
-                             llm_response_object = json.loads(llm_raw_response_str)
-                         except json.JSONDecodeError:
-                             print(f"\nWarning: Could not parse OpenAI response as JSON: {llm_raw_response_str}")
-                             llm_response_object = {"answer": []}
+                        response = await loop.run_in_executor(None, lambda: chat([system_message, human_message]))
+                        llm_raw_response_str = response.content.strip()
+                        try:
+                            llm_response_object = json.loads(llm_raw_response_str)
+                        except json.JSONDecodeError:
+                            llm_response_object = {"answer": []}
 
                     predicted_letters = process_llm_response(llm_response_object)
                     error_message = ""
@@ -544,47 +508,20 @@ def main(provider: str, model_name: str, prompt_mode: str):
                     error_message = f"LLM call failed (attempt {attempt+1}/{max_retries}): {type(e).__name__}: {e}"
                     llm_raw_response_str = f"ERROR: {error_message}"
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        time.sleep(wait_time)
-
-
-            if not success:
-                errors += 1
+                        await asyncio.sleep(2 ** attempt)
 
             if success:
-                 is_correct = evaluate_prediction(predicted_letters, gold_answers_list)
-                 if is_correct:
-                     correct_predictions += 1
-
-                 model_score, max_score = calculate_custom_score(predicted_letters, gold_answers_list, silver_answers_list)
-                 total_model_score += model_score
-                 total_max_score += max_score
+                is_correct = evaluate_prediction(predicted_letters, gold_answers_list)
+                model_score, max_score = calculate_custom_score(predicted_letters, gold_answers_list, silver_answers_list)
             else:
-                 try:
-                     _, max_score_on_error = calculate_custom_score([], gold_answers_list, silver_answers_list)
-                     max_score = max_score_on_error
-                     total_max_score += max_score_on_error
-                 except Exception as score_err:
-                     print(f"Error calculating max score on error: {score_err}")
-                     max_score = 0
+                try:
+                    _, max_score = calculate_custom_score([], gold_answers_list, silver_answers_list)
+                except:
+                    max_score = 0
 
-
-            negative_answers_raw  = row.get("negative_answers")
+            negative_answers_raw = row.get("negative_answers")
             negative_answers_list = process_answer_string(negative_answers_raw)
-            evaluate_and_log_3x2_matrix(
-                gold_answers_list,
-                silver_answers_list,
-                negative_answers_list,
-                predicted_letters,
-                result_row_dict
-            )
-
-            total_gold_answer += result_row_dict["gold_answer"]
-            total_silver_answer += result_row_dict["silver_answer"]
-            total_negative_answer += result_row_dict["negative_answer"]
-            total_gold_negative += result_row_dict["gold_negative"]
-            total_silver_negative += result_row_dict["silver_negative"]
-            total_negative_negative += result_row_dict["negative_negative"]
+            evaluate_and_log_3x2_matrix(gold_answers_list, silver_answers_list, negative_answers_list, predicted_letters, result_row_dict)
 
             result_row_dict["gold_answers"] = format_answer_list_for_csv(row.get("gold_answers"))
             result_row_dict["silver_answers"] = format_answer_list_for_csv(row.get("silver_answers"))
@@ -598,29 +535,112 @@ def main(provider: str, model_name: str, prompt_mode: str):
 
         except Exception as e:
             error_msg = f"Error processing row {index} ({par4pc_identifier}): {type(e).__name__}: {e}"
-            print(f"\n  [!] Error processing row {index} ({par4pc_identifier}): {error_msg}")
-            print(traceback.format_exc())
-            errors += 1
-            with open(error_log_file, 'a', encoding='utf-8') as f_err:
-                 f_err.write(f"{datetime.now().isoformat()} - {error_msg}\n")
-                 f_err.write(traceback.format_exc() + "\n\n")
             result_row_dict["error"] = error_msg
             try:
-                gold_answers_list_on_error = process_answer_string(row.get("gold_answers"))
-                silver_answers_list_on_error = process_answer_string(row.get("silver_answers"))
-                _, max_score_on_error = calculate_custom_score([], gold_answers_list_on_error, silver_answers_list_on_error)
-                result_row_dict["max_score"] = max_score_on_error
-                total_max_score += max_score_on_error
-            except Exception as score_err:
-                print(f"Error calculating max score on outer error: {score_err}")
+                gold_answers_list = process_answer_string(row.get("gold_answers"))
+                silver_answers_list = process_answer_string(row.get("silver_answers"))
+                _, max_score = calculate_custom_score([], gold_answers_list, silver_answers_list)
+                result_row_dict["max_score"] = max_score
+            except:
                 result_row_dict["max_score"] = 0
 
+        pbar.update(1)
+        return result_row_dict
+
+
+def main(provider: str, model_name: str, prompt_mode: str, concurrency: int = 10):
+    print(f"Starting benchmark test with {provider} - {model_name} (concurrency={concurrency})")
+    print(f"Loading data from {DATASET_NAME}/{DATASET_CONFIG}")
+
+    try:
+        df = load_benchmark_data()
+        total_par4pcs = len(df)
+        print(f"Loaded {total_par4pcs} items.")
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        print(traceback.format_exc())
+        return
+
+    if df.empty:
+        print(f"Error: No data found in the dataset.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset_name_for_path = DATASET_NAME.replace("/", "_")
+    result_dir_name = f'result_{timestamp}_{provider}_{model_name}_{prompt_mode}_{dataset_name_for_path}'
+        
+    result_dir = Path(__file__).parent / 'result' / result_dir_name
+    result_dir.mkdir(parents=True, exist_ok=True)
+    results_file = result_dir / "evaluation_results.csv"
+    error_log_file = result_dir / "error_log.txt"
+
+    csv_header = ["identifier", "claim_number", "application_number",
+                  "gold_answers", "silver_answers", "negative_answers",
+                  "predicted_answers", "llm_raw_response", "is_correct", "error",
+                  "model_score", "max_score",
+                  "gold_answer", "silver_answer", "negative_answer",
+                  "gold_negative", "silver_negative", "negative_negative"]
+
+    try:
+        with open(results_file, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=csv_header)
+            writer.writeheader()
+        print(f"Results CSV file initialized: {results_file}")
+    except IOError as e:
+        print(f"Error initializing CSV file {results_file}: {e}")
+        return
+
+    chat = get_chat_model(provider, model_name, prompt_mode)
+
+    # Run async concurrent processing
+    async def run_concurrent():
+        from tqdm import tqdm
+        semaphore = asyncio.Semaphore(concurrency)
+        rows = df.to_dict('records')
+
+        with tqdm(total=len(rows), desc="Processing") as pbar:
+            tasks = [
+                process_single_item(idx, row, chat, provider, prompt_mode, semaphore, results_file, csv_header, error_log_file, pbar)
+                for idx, row in enumerate(rows)
+            ]
+            results = await asyncio.gather(*tasks)
+        return results
+
+    results = asyncio.run(run_concurrent())
+
+    # Aggregate results
+    correct_predictions = 0
+    errors = 0
+    total_model_score = 0
+    total_max_score = 0
+    total_gold_answer = 0
+    total_silver_answer = 0
+    total_negative_answer = 0
+    total_gold_negative = 0
+    total_silver_negative = 0
+    total_negative_negative = 0
+
+    for result_row_dict in results:
+        if result_row_dict["error"]:
+            errors += 1
+        if result_row_dict["is_correct"]:
+            correct_predictions += 1
+        total_model_score += result_row_dict["model_score"]
+        total_max_score += result_row_dict["max_score"]
+        total_gold_answer += result_row_dict["gold_answer"]
+        total_silver_answer += result_row_dict["silver_answer"]
+        total_negative_answer += result_row_dict["negative_answer"]
+        total_gold_negative += result_row_dict["gold_negative"]
+        total_silver_negative += result_row_dict["silver_negative"]
+        total_negative_negative += result_row_dict["negative_negative"]
+
+        # Write to CSV
         try:
             with open(results_file, 'a', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=csv_header)
                 writer.writerow(result_row_dict)
         except IOError as e:
-            print(f"\n  [!] Error writing row {index} to CSV {results_file}: {e}")
+            print(f"Error writing to CSV: {e}")
 
     print(f"\n\n--- Final Results ---")
     print(f"Total par4pcs processed: {total_par4pcs}")
@@ -653,19 +673,18 @@ def run_baseline_evaluation(runs: int = 1):
     Baseline: Randomly select 1+ options (A-H)
     runs: number of repetitions to compute statistics
     """
-    print(f"Starting Baseline evaluation with Hugging Face dataset {DATASET_NAME} (test split)")
+    print(f"Starting Baseline evaluation with {DATASET_NAME}/{DATASET_CONFIG}")
     print(f"Running {runs} times to compute statistics")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
+        df = load_benchmark_data()
         total_par4pcs = len(df)
-        print(f"Loaded {total_par4pcs} par4pcs from Hugging Face dataset {DATASET_NAME} (test split).")
+        print(f"Loaded {total_par4pcs} items.")
     except Exception as e:
-        print(f"Error loading dataset from Hugging Face {DATASET_NAME}: {e}")
+        print(f"Error loading dataset: {e}")
         print(traceback.format_exc())
         return
-    
+
     dataset_name_for_path = DATASET_NAME.replace("/", "_")
 
     if df.empty:
@@ -905,19 +924,18 @@ def run_baseline_2_evaluation(runs: int = 1):
     Baseline 2: Randomly select exactly 1 option from A-H
     runs: number of repetitions to compute statistics
     """
-    print(f"Starting Baseline 2 evaluation with Hugging Face dataset {DATASET_NAME} (test split)")
+    print(f"Starting Baseline 2 evaluation with {DATASET_NAME}/{DATASET_CONFIG}")
     print(f"Running {runs} times to compute statistics")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
+        df = load_benchmark_data()
         total_par4pcs = len(df)
-        print(f"Loaded {total_par4pcs} par4pcs from Hugging Face dataset {DATASET_NAME} (test split).")
+        print(f"Loaded {total_par4pcs} items.")
     except Exception as e:
-        print(f"Error loading dataset from Hugging Face {DATASET_NAME}: {e}")
+        print(f"Error loading dataset: {e}")
         print(traceback.format_exc())
         return
-    
+
     dataset_name_for_path = DATASET_NAME.replace("/", "_")
 
     if df.empty:
@@ -1151,7 +1169,7 @@ def run_baseline_2_evaluation(runs: int = 1):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Run cited patent prediction benchmark test using DxD-Lab/PANORAMA-PAR4PC-Bench dataset from Hugging Face.')
+    parser = argparse.ArgumentParser(description='Run cited patent prediction benchmark test using PANORAMA dataset.')
     parser.add_argument('--provider', type=str, required=False,
                        choices=['openai', 'anthropic', 'google'],
                        help='LLM provider (openai, anthropic, or google). Required if not using baseline mode.')
@@ -1160,6 +1178,8 @@ if __name__ == "__main__":
     parser.add_argument('--prompt_mode', type=str, default='zero-shot',
                     choices=['zero-shot', 'cot', 'cot_base'],
                     help="Prompt style: 'zero-shot' (default) or 'cot'")
+    parser.add_argument('--concurrency', type=int, default=10,
+                        help='Number of concurrent requests (default: 10)')
     parser.add_argument('--baseline', action='store_true',
                         help='Run baseline evaluation (random selection of 1+ options from A-H)')
     parser.add_argument('--baseline-2', action='store_true',
@@ -1177,8 +1197,8 @@ if __name__ == "__main__":
         else:
             if not args.provider or not args.model:
                 parser.error("--provider and --model are required when not using baseline mode.")
-            main(args.provider, args.model, args.prompt_mode)
-            
+            main(args.provider, args.model, args.prompt_mode, args.concurrency)
+
     except Exception as e:
         print(f"Critical error in main execution: {str(e)}")
         print(traceback.format_exc())

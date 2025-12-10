@@ -22,6 +22,7 @@ import random
 import sys # For exit
 from pydantic import BaseModel, Field
 from datasets import load_dataset
+import asyncio
 
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
@@ -32,7 +33,8 @@ load_dotenv()
 
 warnings.filterwarnings(action='ignore')
 
-DATASET_NAME = "DxD-Lab/PANORAMA-PI4PC-Bench"
+DATASET_NAME = "LG-AI-Research/PANORAMA"
+DATASET_CONFIG = "PI4PC"  # 子配置名
 
 class ZeroShotParagraphAnswer(BaseModel):
     answer: int = Field(description="The single integer key of the most relevant paragraph.")
@@ -97,9 +99,9 @@ def get_chat_model(provider: str, model_name: str, prompt_mode: str):
                 }
             }
         )
-        if prompt_mode == "cot" or "cot_base":
+        if prompt_mode in ("cot", "cot_base"):
             structured_llm = chat_model_base.with_structured_output(CoTParagraphAnswer)
-        else: # zero-shot
+        else:  # zero-shot
             structured_llm = chat_model_base.with_structured_output(ZeroShotParagraphAnswer)
 
         return structured_llm 
@@ -356,27 +358,153 @@ def evaluate_and_log_3x2_matrix(gold_keys: List[int], silver_keys: List[int], ne
     result_row_dict["negative_negative"] = matrix["negative_negative"]
 
 
+def load_benchmark_data():
+    """Load benchmark data from local cache or HuggingFace."""
+    import os
+    cache_base = os.path.expanduser("~/.cache/huggingface/hub/datasets--LG-AI-Research--PANORAMA")
+    parquet_path = None
+    if os.path.exists(cache_base):
+        snapshots = os.path.join(cache_base, "snapshots")
+        if os.path.exists(snapshots):
+            for d in os.listdir(snapshots):
+                candidate = os.path.join(snapshots, d, DATASET_CONFIG, "test.parquet")
+                if os.path.exists(candidate):
+                    parquet_path = candidate
+                    break
+
+    if parquet_path:
+        print(f"Loading from local cache: {parquet_path}")
+        df = pd.read_parquet(parquet_path)
+    else:
+        from huggingface_hub import hf_hub_download
+        parquet_path = hf_hub_download(
+            repo_id=DATASET_NAME,
+            filename=f"{DATASET_CONFIG}/test.parquet",
+            repo_type="dataset"
+        )
+        df = pd.read_parquet(parquet_path)
+
+    return df.to_dict("records")
+
+
+async def process_single_item_pi4pc(idx, row, chat, provider, prompt_mode, semaphore, pbar):
+    """Process a single PI4PC item with concurrency control."""
+    async with semaphore:
+        app_num = row.get("application_number", "N/A")
+        claim_num = row.get("claim_number", "N/A")
+
+        prior_raw = row.get("prior_art_specification", {})
+        try:
+            prior = json.loads(prior_raw) if isinstance(prior_raw, str) else prior_raw
+            cited_patent_id = prior.get("patent_id", "N/A") if isinstance(prior, dict) else "N/A"
+        except:
+            cited_patent_id = "N/A"
+        identifier = f"app{app_num}_cl{claim_num}_pa{cited_patent_id}_{idx}"
+
+        gold_keys = [int(k) for k in row.get("gold_answers", [])]
+        silver_keys = [int(k) for k in row.get("silver_answers", [])]
+        negative_keys = [int(k) for k in row.get("negative_answers", [])]
+
+        opts_raw = row.get("options", {})
+        option_keys_for_eval = []
+        try:
+            opts = json.loads(opts_raw) if isinstance(opts_raw, str) else opts_raw
+            if isinstance(opts, dict):
+                sorted_option_items = sorted(opts.items(), key=lambda item: int(str(item[0])))
+                option_keys_for_eval = [int(item[0]) for item in sorted_option_items]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            option_keys_for_eval = []
+
+        prompt = create_paragraph_prompt(row, prompt_mode)
+        llm_response_object = None
+        llm_raw_response_str = ""
+        predicted_key = None
+        error = ""
+        success = False
+
+        for attempt in range(3):
+            try:
+                system_message = SystemMessage(content="You are a patent expert identifying the single most relevant cited paragraph key. Respond in the requested JSON format.")
+                human_message = HumanMessage(content=prompt)
+
+                loop = asyncio.get_event_loop()
+                if provider.lower() == 'google':
+                    llm_response_object = await loop.run_in_executor(None, lambda: chat.invoke([system_message, human_message]))
+                    llm_raw_response_str = llm_response_object.model_dump_json()
+                elif provider.lower() == 'anthropic':
+                    resp = await loop.run_in_executor(None, lambda: chat([system_message, human_message]))
+                    if resp.tool_calls:
+                        llm_response_object = resp.tool_calls[0]["args"]
+                        llm_raw_response_str = json.dumps(llm_response_object)
+                    else:
+                        llm_response_object = {"answer": None}
+                        llm_raw_response_str = resp.content.strip()
+                else:
+                    resp = await loop.run_in_executor(None, lambda: chat([system_message, human_message]))
+                    llm_raw_response_str = resp.content.strip()
+                    try:
+                        llm_response_object = json.loads(llm_raw_response_str)
+                    except json.JSONDecodeError:
+                        llm_response_object = {"answer": None}
+
+                predicted_key = process_llm_response_paragraphs(llm_response_object)
+                success = True
+                break
+            except Exception as e:
+                error = f"LLM fail attempt {attempt+1} for {identifier}: {type(e).__name__}: {str(e)[:200]}"
+                llm_raw_response_str = f"ERROR: {error}"
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+
+        eval_res = calculate_paragraph_score(predicted_key, gold_keys, silver_keys, option_keys_for_eval)
+        cm = calculate_3x2_matrix(gold_keys, silver_keys, negative_keys, [predicted_key] if predicted_key is not None else [])
+
+        row_dict = {
+            "identifier": identifier,
+            "application_number": app_num,
+            "claim_number": claim_num,
+            "cited_patent_id": cited_patent_id,
+            "predicted_key": predicted_key if predicted_key is not None else "",
+            "gold_keys": format_int_list_for_csv(gold_keys),
+            "silver_keys": format_int_list_for_csv(silver_keys),
+            "negative_keys": format_int_list_for_csv(negative_keys),
+            "score": eval_res["score"],
+            "category": eval_res["category"],
+            "is_valid_option_key": eval_res["is_valid_option_key"],
+            "llm_raw_response": llm_raw_response_str,
+            "error": error if not success else "",
+            "gold_answer": cm["gold_answer"],
+            "silver_answer": cm["silver_answer"],
+            "negative_answer": cm["negative_answer"],
+            "gold_negative": cm["gold_negative"],
+            "silver_negative": cm["silver_negative"],
+            "negative_negative": cm["negative_negative"]
+        }
+
+        pbar.update(1)
+        return row_dict, eval_res, cm, success
+
+
 def run_llm_evaluation(args: argparse.Namespace):
-    """LLM 기반 Cited Paragraph 벤치마크를 실행하고 결과를 저장합니다."""
+    """LLM-based Cited Paragraph benchmark with concurrent processing."""
     provider = args.provider
     model_name = args.model
     prompt_mode = args.prompt_mode
+    concurrency = getattr(args, 'concurrency', 10)
 
-    print(f"Starting LLM-based Cited Paragraph benchmark test with {provider} - {model_name} (Prompt: {prompt_mode})")
-    print(f"Loading benchmark data from Hugging Face dataset {DATASET_NAME} (test split)\n")
+    print(f"Starting LLM-based Cited Paragraph benchmark test with {provider} - {model_name} (Prompt: {prompt_mode}, concurrency={concurrency})")
+    print(f"Loading benchmark data from {DATASET_NAME}/{DATASET_CONFIG} (test split)\n")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
-        benchmark_data_list = df.to_dict("records")
+        benchmark_data_list = load_benchmark_data()
     except Exception as e:
-        print(f"❌ Error loading dataset from Hugging Face {DATASET_NAME}: {e}")
+        print(f"Error loading dataset: {e}")
         print(traceback.format_exc())
         return
 
     total_items = len(benchmark_data_list)
     if total_items == 0:
-        print("❌ No rows found in benchmark file"); return
+        print("No rows found in benchmark file"); return
     print(f"Loaded {total_items} items.\n")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -399,6 +527,22 @@ def run_llm_evaluation(args: argparse.Namespace):
         csv.DictWriter(f,fieldnames).writeheader()
 
     chat = get_chat_model(provider, model_name, prompt_mode)
+
+    # Run async concurrent processing
+    async def run_concurrent():
+        from tqdm import tqdm
+        semaphore = asyncio.Semaphore(concurrency)
+        with tqdm(total=len(benchmark_data_list), desc="Processing") as pbar:
+            tasks = [
+                process_single_item_pi4pc(idx, row, chat, provider, prompt_mode, semaphore, pbar)
+                for idx, row in enumerate(benchmark_data_list)
+            ]
+            results = await asyncio.gather(*tasks)
+        return results
+
+    results = asyncio.run(run_concurrent())
+
+    # Aggregate results
     confusion_totals = {
         "gold_answer":0, "silver_answer":0, "negative_answer":0,
         "gold_negative":0, "silver_negative":0, "negative_negative":0
@@ -410,100 +554,11 @@ def run_llm_evaluation(args: argparse.Namespace):
         "score_sum":0
     }
 
-    for idx,row in enumerate(benchmark_data_list):
+    for row_dict, eval_res, cm, success in results:
         stats["processed"] += 1
-        app_num   = row.get("application_number","N/A")
-        claim_num = row.get("claim_number","N/A")
-
-        prior_raw = row.get("prior_art_specification",{})
-        try:
-            prior = json.loads(prior_raw) if isinstance(prior_raw,str) else prior_raw
-            cited_patent_id = prior.get("patent_id","N/A") if isinstance(prior,dict) else "N/A"
-        except:
-            cited_patent_id = "N/A"
-        identifier = f"app{app_num}_cl{claim_num}_pa{cited_patent_id}_{idx}"
-
-        progress_percent = ((idx + 1) / total_items) * 100
-        print(f"Processing LLM: {idx + 1}/{total_items} ({progress_percent:.1f}%) - {identifier}...", end='\r')
-
-        gold_keys    = [int(k) for k in row.get("gold_answers",[])]
-        silver_keys  = [int(k) for k in row.get("silver_answers",[])]
-        negative_keys= [int(k) for k in row.get("negative_answers",[])]
-
-        opts_raw = row.get("options",{})
-        option_keys_for_eval = []
-        try:
-            opts = json.loads(opts_raw) if isinstance(opts_raw,str) else opts_raw
-            if isinstance(opts, dict):
-                sorted_option_items = sorted(opts.items(), key=lambda item: int(str(item[0])))
-                option_keys_for_eval = [int(item[0]) for item in sorted_option_items]
-        except (json.JSONDecodeError, ValueError, TypeError) as e:
-            print(f"\nWarning: Could not parse options for {identifier}: {e}. Options: {opts_raw}")
-            option_keys_for_eval = []
-
-
-        prompt = create_paragraph_prompt(row, prompt_mode)
-        llm_response_object = None
-        llm_raw_response_str = ""
-        predicted_key=None; error=""; success=False
-
-        for attempt in range(3): # LLM call retry loop
-            try:
-                system_message = SystemMessage(content="You are a patent expert identifying the single most relevant cited paragraph key. Respond in the requested JSON format.")
-                human_message = HumanMessage(content=prompt)
-
-                if provider.lower() == 'google':
-                    llm_response_object = chat.invoke([system_message, human_message])
-                    llm_raw_response_str = llm_response_object.model_dump_json()
-                elif provider.lower() == 'anthropic':
-                    resp = chat([system_message, human_message])
-                    if resp.tool_calls:
-                         llm_response_object = resp.tool_calls[0]["args"]
-                         llm_raw_response_str = json.dumps(llm_response_object)
-                    else:
-                         llm_response_object = {"answer": None}
-                         llm_raw_response_str = resp.content.strip()
-                         print(f"\nWarning: Anthropic response did not contain tool calls for {identifier}: {llm_raw_response_str}")
-                else:
-                    resp = chat([system_message, human_message])
-                    llm_raw_response_str = resp.content.strip()
-                    try:
-                        llm_response_object = json.loads(llm_raw_response_str)
-                    except json.JSONDecodeError:
-                        print(f"\nWarning: Could not parse OpenAI response as JSON for {identifier}: {llm_raw_response_str}")
-                        llm_response_object = {"answer": None}
-
-                predicted_key = process_llm_response_paragraphs(llm_response_object)
-                success=True; break
-
-            except Exception as e:
-                error = f"LLM fail attempt {attempt+1} for {identifier}: {type(e).__name__}: {str(e)[:200]}"
-                llm_raw_response_str = f"ERROR: {error}"
-                try:
-                    with open(error_log, 'a', encoding='utf-8') as f_err:
-                        f_err.write(f"--- Error @ {datetime.now().isoformat()} for identifier: {identifier}, Attempt: {attempt+1} ---\n")
-                        f_err.write(f"LLM Response Object before error: {type(llm_response_object)}: {str(llm_response_object)[:500]}\n")
-                        f_err.write(f"Exception Type: {type(e).__name__}\n")
-                        f_err.write(f"Exception Msg: {str(e)[:500]}\n")
-                        f_err.write("Traceback:\n")
-                        traceback.print_exc(file=f_err)
-                        f_err.write("-" * 50 + "\n\n")
-                except IOError as log_err:
-                    print(f"\n[!] Critical: Failed to write to error log file {error_log}: {log_err}")
-
-                if attempt<2:
-                    wait_time = 2**attempt
-                    print(f"\n  [!] {error}. Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
-                else:
-                    print(f"\n  [!] Max retries reached for {identifier}. Last error: {error}")
-
         if not success:
             stats["errors"] += 1
-            predicted_key = None 
 
-        eval_res = calculate_paragraph_score(predicted_key, gold_keys, silver_keys, option_keys_for_eval)
-        
         stats["score_sum"] += eval_res["score"]
         cat = eval_res["category"]
         if   cat=="Gold":   stats["gold"]   +=1
@@ -512,35 +567,14 @@ def run_llm_evaluation(args: argparse.Namespace):
         elif cat=="Invalid Key (Not in Options)": stats["invalid_key"] +=1
         elif cat=="Invalid Response (Non-Integer)": stats["invalid_resp"] +=1
 
-        cm = calculate_3x2_matrix(gold_keys, silver_keys, negative_keys, [predicted_key] if predicted_key is not None else [])
         for k in confusion_totals: confusion_totals[k] += cm[k]
 
-        row_dict = {
-            "identifier":identifier,
-            "application_number":app_num,
-            "claim_number":claim_num,
-            "cited_patent_id":cited_patent_id,
-            "predicted_key":predicted_key if predicted_key is not None else "",
-            "gold_keys":format_int_list_for_csv(gold_keys),
-            "silver_keys":format_int_list_for_csv(silver_keys),
-            "negative_keys":format_int_list_for_csv(negative_keys),
-            "score":eval_res["score"],
-            "category":eval_res["category"],
-            "is_valid_option_key":eval_res["is_valid_option_key"],
-            "llm_raw_response":llm_raw_response_str,
-            "error":error if not success else "",
-            "gold_answer":cm["gold_answer"],
-            "silver_answer":cm["silver_answer"],
-            "negative_answer":cm["negative_answer"],
-            "gold_negative":cm["gold_negative"],
-            "silver_negative":cm["silver_negative"],
-            "negative_negative":cm["negative_negative"]
-        }
+        # Write to CSV
         try:
             with open(results_csv,"a",newline="",encoding="utf-8-sig") as f:
                 csv.DictWriter(f,fieldnames).writerow(row_dict)
         except IOError as csv_err:
-             print(f"\n[!] Critical: Failed to write row {idx+1} to CSV {results_csv}: {csv_err}")
+            print(f"Error writing to CSV: {csv_err}")
 
     print()
 
@@ -558,7 +592,7 @@ def run_llm_evaluation(args: argparse.Namespace):
     avg_score = stats['score_sum'] / max(valid_attempts, 1)
     percent_score = (stats['score_sum'] / max(max_possible_score, 1)) * 100
     print(f"Average score (on {valid_attempts} valid items): {avg_score:.2f} / 2  ({percent_score:.2f}% of max possible score)")
-    print(f"Gold  🥇: {stats['gold']}  | Silver 🥈: {stats['silver']}  | Neg ❌: {stats['negative']}")
+    print(f"Gold: {stats['gold']}  | Silver: {stats['silver']}  | Neg: {stats['negative']}")
     print(f"Invalid key (not in options): {stats['invalid_key']}  | Invalid resp (non-int/parse error): {stats['invalid_resp']}")
     print("Confusion totals:")
     print(f"               | Predicted Positive | Predicted Negative |")
@@ -566,29 +600,20 @@ def run_llm_evaluation(args: argparse.Namespace):
     print(f"Actual Gold    | {confusion_totals['gold_answer']:<18} | {confusion_totals['gold_negative']:<18} |")
     print(f"Actual Silver  | {confusion_totals['silver_answer']:<18} | {confusion_totals['silver_negative']:<18} |")
     print(f"Actual Negative| {confusion_totals['negative_answer']:<18} | {confusion_totals['negative_negative']:<18} |")
-    print("\nDetailed CSV →", results_csv)
-    if stats["errors"] > 0:
-        print(f"Error details (LLM calls) logged to: {error_log}")
-
+    print("\nDetailed CSV ->", results_csv)
     print(f"\nDetailed results saved in: {results_dir}")
-    if os.path.exists(error_log) and os.path.getsize(error_log) > 0:
-         print(f"Error details logged to: {error_log}")
-    elif stats["errors"] > 0:
-         print(f"Processing errors occurred, check terminal output for details.")
 
 
 def run_baseline_1_evaluation(args: argparse.Namespace):
     """Baseline 1: Random choice"""
     num_runs = args.baseline_1_runs
-    print(f"Starting Baseline 1 (Random Choice) evaluation using Hugging Face dataset {DATASET_NAME} (test split)")
+    print(f"Starting Baseline 1 (Random Choice) evaluation using {DATASET_NAME}/{DATASET_CONFIG} (test split)")
     print(f"Will run {num_runs} times to compute statistics.")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
-        benchmark_data_list = df.to_dict("records")
+        benchmark_data_list = load_benchmark_data()
     except Exception as e:
-        print(f"❌ Error loading dataset from Hugging Face {DATASET_NAME}: {e}")
+        print(f"❌ Error loading dataset: {e}")
         print(traceback.format_exc())
         return
 
@@ -820,26 +845,20 @@ def run_baseline_1_evaluation(args: argparse.Namespace):
 
 def run_baseline_2_evaluation(args: argparse.Namespace):
     """Baseline 2: N-th choice"""
-    print(f"Starting Baseline 2 (N-th Choice) evaluation using Hugging Face dataset {DATASET_NAME} (test split)")
+    print(f"Starting Baseline 2 (N-th Choice) evaluation using {DATASET_NAME}/{DATASET_CONFIG} (test split)")
 
     try:
-        ds = load_dataset(DATASET_NAME, split="test")
-        df = ds.to_pandas()
-        benchmark_data_list = df.to_dict("records")
+        benchmark_data_list = load_benchmark_data()
     except Exception as e:
-        print(f"❌ Error loading dataset from Hugging Face {DATASET_NAME}: {e}")
+        print(f"❌ Error loading dataset: {e}")
         print(traceback.format_exc())
         return
-    
+
     total_items = len(benchmark_data_list)
     if total_items == 0: print("❌ No rows found in benchmark file"); return
     print(f"Loaded {total_items} items.\n")
-    
+
     dataset_name_for_path = DATASET_NAME.replace("/", "_")
-    
-    if df.empty:
-        print(f"Error: No data found in the dataset.")
-        return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_dir = Path(__file__).parent / 'result'
@@ -1045,7 +1064,7 @@ def run_baseline_2_evaluation(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Run cited paragraph prediction benchmark test using DxD-Lab/PANORAMA-PI4PC-Bench dataset from Hugging Face.')
+    parser = argparse.ArgumentParser(description='Run cited paragraph prediction benchmark test using PANORAMA dataset.')
 
     parser.add_argument('--provider', type=str,
                        choices=['openai', 'anthropic', 'google'],
@@ -1055,6 +1074,8 @@ if __name__ == "__main__":
     parser.add_argument('--prompt_mode', type=str, default='zero-shot',
                     choices=['zero-shot', 'cot', 'cot_base'],
                     help="Prompt style: 'zero-shot' (default) or 'cot' (Chain-of-Thought). Used in LLM mode.")
+    parser.add_argument('--concurrency', type=int, default=10,
+                        help='Number of concurrent requests (default: 10)')
 
     baseline_group = parser.add_mutually_exclusive_group()
     baseline_group.add_argument('--baseline-1', action='store_true', help='Run baseline 1 mode (random choice).')
@@ -1068,7 +1089,7 @@ if __name__ == "__main__":
     if not args.baseline_1 and not args.baseline_2: # LLM Mode
         if not args.provider or not args.model:
             parser.error("--provider and --model are required when not in baseline mode.")
-    
+
     try:
         import pandas
         import pyarrow

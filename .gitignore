@@ -1,0 +1,4 @@
+*results.csv
+*error_log.txt
+.env
+__pycache__/
